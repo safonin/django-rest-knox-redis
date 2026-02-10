@@ -1,6 +1,6 @@
 [project]
 name = "django-rest-knox-redis"
-version = "0.1.1"
+version = "0.1.3"
 description = "Redis caching layer for django-rest-knox - dramatically reduce database load on token authentication"
 readme = "README.md"
 license = {text = "MIT"}
