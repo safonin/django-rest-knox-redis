@@ -1,6 +1,6 @@
 [project]
 name = "django-rest-knox-redis"
-version = "0.1.0"
+version = "0.1.1"
 description = "Redis caching layer for django-rest-knox - dramatically reduce database load on token authentication"
 readme = "README.md"
 license = {text = "MIT"}
@@ -58,11 +58,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/django-rest-knox-redis"
-Documentation = "https://github.com/yourusername/django-rest-knox-redis#readme"
-Repository = "https://github.com/yourusername/django-rest-knox-redis"
-Issues = "https://github.com/yourusername/django-rest-knox-redis/issues"
-Changelog = "https://github.com/yourusername/django-rest-knox-redis/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/safonin/django-rest-knox-redis"
+Documentation = "https://github.com/safonin/django-rest-knox-redis#readme"
+Repository = "https://github.com/safonin/django-rest-knox-redis"
+Issues = "https://github.com/safonin/django-rest-knox-redis/issues"
+Changelog = "https://github.com/safonin/django-rest-knox-redis/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
