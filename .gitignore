@@ -139,7 +139,6 @@ Thumbs.db
 
 # uv
 .uv/
-uv.lock
 
 # Project specific
 .claude/

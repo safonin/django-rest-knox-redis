@@ -12,7 +12,7 @@ class KnoxRedisConfig(AppConfig):
     verbose_name = "Knox Redis Cache"
     default_auto_field = "django.db.models.BigAutoField"
 
-    def ready(self):
+    def ready(self) -> None:
         """
         Called when Django starts.
 

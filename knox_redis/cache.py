@@ -1,274 +1,268 @@
-"""
-Redis cache operations for knox tokens.
-
-Uses django-redis through Django's cache framework.
-"""
+"""Bounded Redis cache operations for Knox authentication tokens."""
 
 import json
 import logging
-from typing import Any
+import math
+from datetime import datetime, timedelta
+from typing import Any, TypedDict, cast
 
 from django.core.cache import caches
+from django.core.serializers.json import DjangoJSONEncoder
+from django.utils import timezone
 
+from knox_redis.exceptions import CacheInvalidationError
 from knox_redis.settings import knox_redis_settings
 
 logger = logging.getLogger(__name__)
 
+CACHE_SCHEMA_VERSION = 2
+
+
+class CachedTokenData(TypedDict):
+    """Validated version-2 token cache payload."""
+
+    schema_version: int
+    digest: str
+    user_id: Any
+    created: str
+    expiry: str | None
+    token_key: str
+
 
 class TokenCache:
-    """
-    Redis cache operations for knox tokens.
-
-    Key schema:
-        knox:token:{token_key} -> JSON {digest, user_id, created, expiry}
-        knox:user:{user_id}:tokens -> Set of token_keys
-
-    Uses django-redis through Django cache framework.
-    On Redis errors, logs warning and returns None / continues silently.
-    """
+    """Redis operations with bounded entries and explicit invalidation failures."""
 
     @classmethod
-    def _get_cache(cls):
-        """Get the configured cache backend."""
+    def _get_cache(cls) -> Any:
         return caches[knox_redis_settings.CACHE_ALIAS]
 
     @classmethod
-    def _get_redis_client(cls):
-        """
-        Get the raw redis client from django-redis.
-
-        Returns None if not available.
-        """
+    def _get_redis_client(cls) -> Any | None:
         try:
             cache = cls._get_cache()
-            # django-redis provides client.get_client() method
             if not hasattr(cache, "client"):
                 logger.warning(
-                    f"Cache backend {type(cache).__name__} does not have 'client' attribute. "
-                    "Make sure you're using django-redis as your cache backend."
+                    "Cache backend %s is not provided by django-redis.",
+                    type(cache).__name__,
                 )
                 return None
             return cache.client.get_client()
-        except Exception as e:
-            logger.warning(f"Failed to get Redis client: {e}")
+        except Exception as exc:
+            logger.warning("Failed to get Redis client: %s", exc)
             return None
 
     @classmethod
     def _make_token_key(cls, token_key: str) -> str:
-        """Generate Redis key for a token."""
-        prefix = knox_redis_settings.REDIS_KEY_PREFIX
-        return f"{prefix}:token:{token_key}"
+        return f"{knox_redis_settings.REDIS_KEY_PREFIX}:token:{token_key}"
 
     @classmethod
     def _make_user_tokens_key(cls, user_id: Any) -> str:
-        """Generate Redis key for user's token set."""
-        prefix = knox_redis_settings.REDIS_KEY_PREFIX
-        return f"{prefix}:user:{user_id}:tokens"
+        return f"{knox_redis_settings.REDIS_KEY_PREFIX}:user:{user_id}:tokens"
 
-    @classmethod
-    def get_token(cls, token_key: str) -> dict | None:
-        """
-        Retrieve token data from Redis cache.
-
-        Args:
-            token_key: First 15 characters of the token (knox token_key)
-
-        Returns:
-            Dict with {digest, user_id, created, expiry, token_key} or None if not found
-        """
-        if not knox_redis_settings.CACHE_ENABLED:
-            return None
-
-        try:
-            client = cls._get_redis_client()
-            if client is None:
-                return None
-
-            redis_key = cls._make_token_key(token_key)
-            data = client.get(redis_key)
-
-            if data is None:
-                return None
-
-            # Data stored as JSON string
-            if isinstance(data, bytes):
-                data = data.decode("utf-8")
-
-            return json.loads(data)
-
-        except Exception as e:
-            logger.warning(f"Redis get_token failed: {e}")
-            return None
-
-    @classmethod
-    def set_token(cls, auth_token) -> bool:
-        """
-        Cache an AuthToken instance in Redis.
-
-        Also maintains the user's token index for efficient logout-all.
-
-        Args:
-            auth_token: Knox AuthToken model instance
-
-        Returns:
-            True if cached successfully, False otherwise
-        """
-        if not knox_redis_settings.CACHE_ENABLED:
-            logger.debug("Knox Redis cache is disabled, skipping set_token")
+    @staticmethod
+    def _parse_datetime(value: object) -> bool:
+        if not isinstance(value, str):
             return False
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return False
+        return True
 
+    @classmethod
+    def _parse_payload(
+        cls, raw_data: object, expected_token_key: str
+    ) -> CachedTokenData | None:
+        if isinstance(raw_data, bytes):
+            raw_data = raw_data.decode("utf-8")
+        if not isinstance(raw_data, str):
+            return None
+
+        parsed = json.loads(raw_data)
+        if not isinstance(parsed, dict) or parsed.get("schema_version") != 2:
+            return None
+        if not isinstance(parsed.get("digest"), str):
+            return None
+        if parsed.get("token_key") != expected_token_key:
+            return None
+        if not cls._parse_datetime(parsed.get("created")):
+            return None
+        expiry = parsed.get("expiry")
+        if expiry is not None and not cls._parse_datetime(expiry):
+            return None
+        if "user_id" not in parsed:
+            return None
+        return CachedTokenData(
+            schema_version=CACHE_SCHEMA_VERSION,
+            digest=parsed["digest"],
+            user_id=parsed["user_id"],
+            created=parsed["created"],
+            expiry=expiry,
+            token_key=parsed["token_key"],
+        )
+
+    @classmethod
+    def get_token(cls, token_key: str) -> CachedTokenData | None:
+        """Return a validated v2 payload, treating all read failures as misses."""
+        if not knox_redis_settings.CACHE_ENABLED:
+            return None
         try:
             client = cls._get_redis_client()
             if client is None:
-                logger.warning("Redis client is None, cannot cache token")
+                return None
+            raw_data = client.get(cls._make_token_key(token_key))
+            if raw_data is None:
+                return None
+            return cls._parse_payload(raw_data, token_key)
+        except Exception as exc:
+            logger.warning("Redis get_token failed: %s", exc)
+            return None
+
+    @classmethod
+    def _expires_at_for_expiry(cls, expiry: datetime | None) -> int | None:
+        """Return an absolute Redis expiry no later than the DB expiry."""
+        maximum = cast(int, knox_redis_settings.MAX_TOKEN_CACHE_TTL)
+        now = timezone.now()
+        maximum_expiry = now + timedelta(seconds=maximum)
+        if expiry is not None and timezone.is_naive(expiry):
+            expiry = timezone.make_aware(expiry)
+        if expiry is not None and (expiry - now).total_seconds() < 1:
+            return None
+        effective_expiry = min(expiry, maximum_expiry) if expiry else maximum_expiry
+        expires_at = math.floor(effective_expiry.timestamp())
+        return expires_at if expires_at > math.floor(now.timestamp()) else None
+
+    @classmethod
+    def set_token(cls, auth_token: Any) -> bool:
+        """Cache an authoritative token row for no longer than its DB lifetime."""
+        if not knox_redis_settings.CACHE_ENABLED:
+            return False
+        try:
+            expires_at = cls._expires_at_for_expiry(auth_token.expiry)
+            if expires_at is None:
+                return False
+            client = cls._get_redis_client()
+            if client is None:
                 return False
 
-            token_key = auth_token.token_key
-            redis_key = cls._make_token_key(token_key)
-            user_tokens_key = cls._make_user_tokens_key(auth_token.user_id)
-
-            # Prepare token data as JSON
-            data = {
+            data: CachedTokenData = {
+                "schema_version": CACHE_SCHEMA_VERSION,
                 "digest": auth_token.digest,
                 "user_id": auth_token.user_id,
                 "created": auth_token.created.isoformat(),
-                "expiry": auth_token.expiry.isoformat() if auth_token.expiry else None,
+                "expiry": (
+                    auth_token.expiry.isoformat() if auth_token.expiry else None
+                ),
                 "token_key": auth_token.token_key,
             }
-
-            # Use pipeline for atomic operations
+            redis_key = cls._make_token_key(auth_token.token_key)
+            user_tokens_key = cls._make_user_tokens_key(auth_token.user_id)
             pipe = client.pipeline()
-            pipe.set(redis_key, json.dumps(data))
-            pipe.sadd(user_tokens_key, token_key)
+            pipe.set(
+                redis_key,
+                json.dumps(data, cls=DjangoJSONEncoder),
+                exat=expires_at,
+            )
+            pipe.sadd(user_tokens_key, auth_token.token_key)
+            # Every token entry is bounded by MAX_TOKEN_CACHE_TTL. Keeping the
+            # index for that full window prevents a short-lived token from
+            # shortening the index lifetime of another cached token.
+            index_expires_at = cls._expires_at_for_expiry(None)
+            if index_expires_at is not None:
+                pipe.expireat(user_tokens_key, index_expires_at)
             pipe.execute()
-
-            logger.debug(f"Token cached successfully: {redis_key}")
             return True
-
-        except Exception as e:
-            logger.warning(f"Redis set_token failed: {e}")
+        except Exception as exc:
+            logger.warning("Redis set_token failed: %s", exc)
             return False
 
     @classmethod
-    def delete_token(cls, token_key: str, user_id: Any = None) -> bool:
-        """
-        Remove a specific token from cache.
-
-        Args:
-            token_key: First 15 characters of the token
-            user_id: If provided, also removes from user's token index
-
-        Returns:
-            True if deleted successfully, False otherwise
-        """
+    def delete_token(
+        cls,
+        token_key: str,
+        user_id: Any = None,
+        *,
+        raise_on_error: bool = False,
+    ) -> bool:
+        """Delete one entry; optionally require Redis to confirm invalidation."""
         if not knox_redis_settings.CACHE_ENABLED:
             return False
-
         try:
             client = cls._get_redis_client()
             if client is None:
-                return False
-
-            redis_key = cls._make_token_key(token_key)
-
+                raise ConnectionError("Redis client is unavailable.")
             pipe = client.pipeline()
-            pipe.delete(redis_key)
-
+            pipe.delete(cls._make_token_key(token_key))
             if user_id is not None:
-                user_tokens_key = cls._make_user_tokens_key(user_id)
-                pipe.srem(user_tokens_key, token_key)
-
+                pipe.srem(cls._make_user_tokens_key(user_id), token_key)
             pipe.execute()
             return True
-
-        except Exception as e:
-            logger.warning(f"Redis delete_token failed: {e}")
+        except Exception as exc:
+            if raise_on_error:
+                raise CacheInvalidationError() from exc
+            logger.warning("Redis delete_token failed: %s", exc)
             return False
 
     @classmethod
-    def delete_all_user_tokens(cls, user_id: Any) -> bool:
-        """
-        Remove all tokens for a user from cache.
-
-        Used by LogoutAllView for efficient cache invalidation.
-
-        Args:
-            user_id: User's primary key
-
-        Returns:
-            True if deleted successfully, False otherwise
-        """
+    def delete_all_user_tokens(
+        cls, user_id: Any, *, raise_on_error: bool = False
+    ) -> bool:
+        """Delete entries listed in a user's bounded token index."""
         if not knox_redis_settings.CACHE_ENABLED:
             return False
-
         try:
             client = cls._get_redis_client()
             if client is None:
-                return False
-
+                raise ConnectionError("Redis client is unavailable.")
             user_tokens_key = cls._make_user_tokens_key(user_id)
-
-            # Get all token keys for this user
             token_keys = client.smembers(user_tokens_key)
-
-            if not token_keys:
-                return True
-
-            # Build list of Redis keys to delete
             pipe = client.pipeline()
-            for tk in token_keys:
-                if isinstance(tk, bytes):
-                    tk = tk.decode("utf-8")
-                redis_key = cls._make_token_key(tk)
-                pipe.delete(redis_key)
-
-            # Also delete the user's token index
+            for token_key in token_keys:
+                if isinstance(token_key, bytes):
+                    token_key = token_key.decode("utf-8")
+                pipe.delete(cls._make_token_key(token_key))
             pipe.delete(user_tokens_key)
             pipe.execute()
-
             return True
-
-        except Exception as e:
-            logger.warning(f"Redis delete_all_user_tokens failed: {e}")
+        except Exception as exc:
+            if raise_on_error:
+                raise CacheInvalidationError() from exc
+            logger.warning("Redis delete_all_user_tokens failed: %s", exc)
             return False
 
     @classmethod
-    def update_token_expiry(cls, token_key: str, new_expiry) -> bool:
-        """
-        Update expiry field for auto-refresh functionality.
-
-        Args:
-            token_key: First 15 characters of the token
-            new_expiry: New expiry datetime or None
-
-        Returns:
-            True if updated successfully, False otherwise
-        """
+    def update_token_expiry(cls, token_key: str, new_expiry: datetime | None) -> bool:
+        """Update a cached payload while preserving the bounded TTL contract."""
         if not knox_redis_settings.CACHE_ENABLED:
             return False
-
         try:
+            expires_at = cls._expires_at_for_expiry(new_expiry)
+            if expires_at is None:
+                return cls.delete_token(token_key)
             client = cls._get_redis_client()
             if client is None:
                 return False
-
-            redis_key = cls._make_token_key(token_key)
-
-            # Get current data
-            data = client.get(redis_key)
+            raw_data = client.get(cls._make_token_key(token_key))
+            if raw_data is None:
+                return False
+            data = cls._parse_payload(raw_data, token_key)
             if data is None:
                 return False
-
-            if isinstance(data, bytes):
-                data = data.decode("utf-8")
-
-            token_data = json.loads(data)
-            token_data["expiry"] = new_expiry.isoformat() if new_expiry else None
-
-            # Update with new expiry
-            client.set(redis_key, json.dumps(token_data))
+            data["expiry"] = new_expiry.isoformat() if new_expiry else None
+            pipe = client.pipeline()
+            pipe.set(
+                cls._make_token_key(token_key),
+                json.dumps(data, cls=DjangoJSONEncoder),
+                exat=expires_at,
+            )
+            index_expires_at = cls._expires_at_for_expiry(None)
+            if index_expires_at is not None:
+                pipe.expireat(
+                    cls._make_user_tokens_key(data["user_id"]),
+                    index_expires_at,
+                )
+            pipe.execute()
             return True
-
-        except Exception as e:
-            logger.warning(f"Redis update_token_expiry failed: {e}")
+        except Exception as exc:
+            logger.warning("Redis update_token_expiry failed: %s", exc)
             return False

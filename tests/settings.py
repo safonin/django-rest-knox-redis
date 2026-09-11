@@ -2,6 +2,8 @@
 Django settings for tests.
 """
 
+import os
+
 SECRET_KEY = "test-secret-key-for-knox-redis"
 
 DEBUG = True
@@ -22,11 +24,20 @@ DATABASES = {
 }
 
 # Use fakeredis for testing
-CACHES = {
+CACHES: dict[str, dict[str, object]] = {
     "default": {
         "BACKEND": "django.core.cache.backends.dummy.DummyCache",
     }
 }
+
+if redis_test_url := os.environ.get("KNOX_REDIS_TEST_URL"):
+    CACHES["default"] = {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": redis_test_url,
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        },
+    }
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [

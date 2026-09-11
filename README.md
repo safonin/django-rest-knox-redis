@@ -1,401 +1,281 @@
 # django-rest-knox-redis
 
-[![PyPI version](https://badge.fury.io/py/django-rest-knox-redis.svg)](https://badge.fury.io/py/django-rest-knox-redis)
-[![Python Versions](https://img.shields.io/pypi/pyversions/django-rest-knox-redis.svg)](https://pypi.org/project/django-rest-knox-redis/)
-[![Django Versions](https://img.shields.io/badge/django-4.2%20%7C%205.0%20%7C%206.0-green.svg)](https://pypi.org/project/django-rest-knox-redis/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://github.com/yourusername/django-rest-knox-redis/actions/workflows/tests.yml/badge.svg)](https://github.com/safonin/django-rest-knox-redis/actions)
+[![PyPI](https://img.shields.io/pypi/v/django-rest-knox-redis.svg)](https://pypi.org/project/django-rest-knox-redis/)
+[![Python](https://img.shields.io/pypi/pyversions/django-rest-knox-redis.svg)](https://pypi.org/project/django-rest-knox-redis/)
+[![Django](https://img.shields.io/badge/Django-5.2%20%7C%206.0-0C4B33.svg)](https://www.djangoproject.com/)
+[![Tests](https://github.com/safonin/django-rest-knox-redis/actions/workflows/tests.yml/badge.svg)](https://github.com/safonin/django-rest-knox-redis/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Redis caching layer for [django-rest-knox](https://github.com/jazzband/django-rest-knox) that dramatically reduces database load on token authentication.**
+A bounded Redis lookup layer for
+[django-rest-knox](https://github.com/jazzband/django-rest-knox). It preserves
+Knox's `AuthToken` request contract, makes revocation database-authoritative,
+and offers an optional synchronous
+[django-modern-rest](https://github.com/wemake-services/django-modern-rest)
+adapter.
 
----
+## Security and consistency model
 
-## The Problem
+Redis is an acceleration hint, never the source of truth:
 
-Every API request with token authentication hits your database. With **django-rest-knox**, each request requires:
+1. A cache hit verifies the raw token digest against the cached digest.
+2. Authentication then selects the exact token and its user from the database.
+3. `request.auth` and `request._auth` receive the real Knox `AuthToken` model,
+   so Knox logout and application code can call model methods normally.
+4. Token deletion invalidates Redis in `pre_delete`. If Redis cannot confirm
+   invalidation, deletion fails closed and the surrounding database operation
+   is rolled back. A best-effort `on_commit` deletion closes the
+   invalidate-before-commit race.
 
-1. Query database by `token_key` index
-2. Fetch token record with user data
-3. Validate token hash
-4. Check user status
+This deliberately trades revocation availability for consistency: logout,
+logout-all, admin deletion, ORM deletion, expiry cleanup, or a user cascade can
+return/raise a 503-class `CacheInvalidationError` while Redis is unavailable.
+Ordinary authentication can still fall back to Knox's database path when a
+Redis read or cache population fails. A stale entry left by a failed
+post-commit cleanup cannot authenticate because every hit rechecks the token
+row.
 
-**At scale, this becomes a bottleneck:**
+All cache entries are bounded:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Database Load Analysis                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  Requests/sec    DB Queries/sec    DB Connection Pool Usage     │
-│  ────────────    ──────────────    ────────────────────────     │
-│       100             100                  10%                  │
-│       500             500                  50%                  │
-│     1,000           1,000                 100% ← Saturation     │
-│     2,000           2,000                 200% ← Connection     │
-│                                                 waiting         │
-└─────────────────────────────────────────────────────────────────┘
-```
+- finite Knox tokens use `min(remaining token lifetime,
+  MAX_TOKEN_CACHE_TTL)`;
+- `TOKEN_TTL=None` uses `MAX_TOKEN_CACHE_TTL` as the mandatory revalidation
+  bound;
+- entries with less than one whole second remaining are not cached;
+- the default maximum is 300 seconds.
 
-**Real-world impact:**
-- 🔴 **1,000 req/sec** = 1,000 database queries just for authentication
-- 🔴 **Database connections exhausted** under load
-- 🔴 **Latency spikes** when DB is under pressure
-- 🔴 **Cascading failures** affecting all services sharing the DB
+When Knox `AUTO_REFRESH=True`, token caching is disabled and authentication is
+delegated to Knox. This preserves `MIN_REFRESH_INTERVAL` and
+`AUTO_REFRESH_MAX_TTL` semantics without maintaining a competing Redis expiry.
 
----
+## Measured authentication operations
 
-## The Solution
+These counts are regression-tested with Django 6.0, django-rest-knox 5.1, one
+valid token, and `AUTO_REFRESH=False`. They count all SQL, not only token-model
+manager calls.
 
-**django-rest-knox-redis** adds a Redis caching layer that eliminates most database queries:
+| Path | Redis commands / round trips | SQL queries | Result |
+| --- | --- | ---: | --- |
+| Cache hit | `GET` / 1 | 1 | Joined exact token + user row |
+| Cache miss | `GET`, then pipelined `SET`, `SADD`, `EXPIREAT` / 2 | 2 | Knox lookup + Knox expired-sibling cleanup query, then cache population |
+| `AUTO_REFRESH=True` | none | Knox-owned | Two reads for the simple valid-token case, plus an `UPDATE` only when Knox's refresh interval permits |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    With Redis Caching                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  Request Flow:                                                  │
-│                                                                 │
-│  ┌──────────┐     ┌───────────┐     ┌──────────────┐            │
-│  │  Client  │────▶│   Redis   │────▶│   Database   │            │
-│  └──────────┘     └───────────┘     └──────────────┘            │
-│                         │                   │                   │
-│                    95% HIT ✓           5% MISS                  │
-│                    (< 1ms)            (then cache)              │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+The cache therefore reduces the tested valid-token path from two SQL queries
+to one; it does not eliminate database authentication queries. Previous
+unreproducible claims such as “22x faster”, “95% fewer queries”, and “7x more
+throughput” are intentionally not claimed. Measure end-to-end behavior against
+your database, Redis topology, user model, and token population.
 
----
+## Compatibility
 
-## Performance Comparison
+The base package supports:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              Authentication Latency (p99)                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  knox (DB only)     ████████████████████████████████  45ms      │
-│  knox-redis (hit)   ██                                 2ms      │
-│  knox-redis (miss)  ████████████████████████████████  47ms      │
-│                                                                 │
-│  * Redis cache hit: 22x faster                                  │
-│                                                                 │
-├─────────────────────────────────────────────────────────────────┤
-│              Database Queries per 10,000 Requests               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  knox (DB only)     ████████████████████████████  10,000        │
-│  knox-redis (95%)   █                                 500       │
-│                                                                 │
-│  * 95% cache hit rate = 95% reduction in DB queries             │
-│                                                                 │
-├─────────────────────────────────────────────────────────────────┤
-│              Throughput (requests/sec on same hardware)         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  knox (DB only)     ████████████                   1,200        │
-│  knox-redis         ████████████████████████████   8,500        │
-│                                                                 │
-│  * 7x higher throughput with Redis caching                      │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Python | Django |
+| --- | --- |
+| 3.10–3.14 | 5.2 |
+| 3.12–3.14 | 6.0 |
 
----
-
-## How It Works
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Authentication Flow                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   1. Request with "Authorization: Token xxx..."                 │
-│                          │                                      │
-│                          ▼                                      │
-│   2. ┌─────────────────────────────────────┐                    │
-│      │  Check Redis cache by token_key     │                    │
-│      │  Key: knox:token:{first_15_chars}   │                    │
-│      └─────────────────────────────────────┘                    │
-│                          │                                      │
-│              ┌───────────┴───────────┐                          │
-│              │                       │                          │
-│         Cache HIT               Cache MISS                      │
-│              │                       │                          │
-│              ▼                       ▼                          │
-│   3. Validate hash          4. Query database                   │
-│      Get user from DB          Validate token                   │
-│      (by PK - fast)            Cache in Redis                   │
-│              │                       │                          │
-│              └───────────┬───────────┘                          │
-│                          │                                      │
-│                          ▼                                      │
-│   5. Return (user, token) to DRF                                │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Key design decisions:**
-
-- ✅ **User always fetched from DB** - ensures `is_active` changes apply immediately
-- ✅ **Token data cached indefinitely** - no TTL, explicit invalidation only
-- ✅ **Graceful degradation** - falls back to DB if Redis unavailable
-- ✅ **Atomic cache invalidation** - on logout, logoutall, token deletion
-
----
+Runtime bounds are DRF 3.16.1–3.17, django-rest-knox 5.0.4–5.1, and
+django-redis 6–7. The CI matrix installs each supported Python/Django
+combination into a fresh environment, includes an explicit lower-bound job for
+DRF 3.16.1, Knox 5.0.4, and django-redis 6.0.0, and asserts the resolved
+versions. The optional DMR extra requires Python 3.11 or newer through
+django-modern-rest.
 
 ## Installation
 
-```bash
-pip install django-rest-knox-redis
-```
-
-Or with **uv**:
+DRF only:
 
 ```bash
-uv add django-rest-knox-redis
+python -m pip install django-rest-knox-redis
 ```
 
----
+With optional DMR integration:
 
-## Quick Start
+```bash
+python -m pip install 'django-rest-knox-redis[dmr]'
+```
 
-### 1. Configure Django Settings
+The extra is exactly `django-modern-rest>=0.12`; importing the base package
+does not import or require DMR. The example below uses DMR's optional msgspec
+serializer plugin, so install its backend too:
+
+```bash
+python -m pip install 'django-rest-knox-redis[dmr]' 'django-modern-rest[msgspec]'
+```
+
+## DRF configuration
+
+Add the applications and a django-redis cache:
 
 ```python
 # settings.py
+from datetime import timedelta
 
 INSTALLED_APPS = [
     # ...
-    'rest_framework',
-    'knox',
-    'knox_redis',
+    "rest_framework",
+    "knox",
+    "knox_redis",
 ]
 
-# Configure Redis cache with django-redis
 CACHES = {
-    'default': {
-        'BACKEND': 'django_redis.cache.RedisCache',
-        'LOCATION': 'redis://127.0.0.1:6379/1',
-        'OPTIONS': {
-            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-        }
-    }
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        },
+    },
 }
 
-# Knox Redis settings
-REST_KNOX_REDIS = {
-    'CACHE_ALIAS': 'default',      # Which Django cache to use
-    'REDIS_KEY_PREFIX': 'knox',    # Prefix for Redis keys
-    'CACHE_ENABLED': True,         # Toggle caching on/off
-}
-
-# Standard Knox settings (optional)
 REST_KNOX = {
-    'TOKEN_TTL': None,             # Token lifetime
-    'AUTO_REFRESH': True,          # Auto-refresh on activity
+    "TOKEN_TTL": timedelta(hours=10),
+    "AUTO_REFRESH": False,
 }
 
-# IMPORTANT: Replace knox.auth.TokenAuthentication with knox_redis.auth.TokenAuthentication
+REST_KNOX_REDIS = {
+    "CACHE_ALIAS": "default",
+    "REDIS_KEY_PREFIX": "knox",
+    "CACHE_ENABLED": True,
+    "MAX_TOKEN_CACHE_TTL": 300,
+}
+
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': [
-        'knox_redis.auth.TokenAuthentication',  # <-- Use knox_redis instead of knox
-        # ... other authentication classes
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "knox_redis.auth.TokenAuthentication",
     ],
 }
 ```
 
-### 2. Update URLs
+Use the Redis-aware Knox views so their full request authentication flow uses
+the same authenticator:
 
 ```python
 # urls.py
-from knox_redis.views import LoginView, LogoutView, LogoutAllView
+from django.urls import path
+from knox_redis.views import LoginView, LogoutAllView, LogoutView
 
 urlpatterns = [
-    path('api/auth/login/', LoginView.as_view(), name='knox_login'),
-    path('api/auth/logout/', LogoutView.as_view(), name='knox_logout'),
-    path('api/auth/logoutall/', LogoutAllView.as_view(), name='knox_logoutall'),
+    path("api/auth/login/", LoginView.as_view(), name="knox_login"),
+    path("api/auth/logout/", LogoutView.as_view(), name="knox_logout"),
+    path("api/auth/logout-all/", LogoutAllView.as_view(), name="knox_logout_all"),
 ]
 ```
 
-### 3. Use in Views (optional per-view override)
-
-If you set `DEFAULT_AUTHENTICATION_CLASSES` globally, you don't need to specify it per view.
-But you can still override authentication per view if needed:
+The authenticator is also available per view:
 
 ```python
-# views.py
-from rest_framework.views import APIView
-from rest_framework.response import Response
 from knox_redis.auth import TokenAuthentication
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
 
 class ProtectedView(APIView):
-    # Optional: override if not set globally in REST_FRAMEWORK settings
-    authentication_classes = [TokenAuthentication]
+    authentication_classes = (TokenAuthentication,)
 
     def get(self, request):
-        return Response({'user': request.user.username})
+        return Response({"username": request.user.get_username()})
 ```
 
-**That's it!** Your token authentication is now cached in Redis.
+### Settings
 
----
+| Setting | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `CACHE_ALIAS` | `str` | `"default"` | Django cache alias backed by django-redis |
+| `REDIS_KEY_PREFIX` | `str` | `"knox"` | Prefix for token and user-index keys |
+| `CACHE_ENABLED` | `bool` | `True` | Enables Redis reads, population, and invalidation |
+| `MAX_TOKEN_CACHE_TTL` | positive `int` | `300` | Maximum seconds before database revalidation, including non-expiring Knox tokens |
 
-## Migration from knox
+Settings are reloadable with Django's `override_settings` and preserve the
+0.1.x names and defaults, except that cache entries are now always bounded.
 
-If you're already using `knox.auth.TokenAuthentication`, migration is simple:
+### Redis keys
 
-### Before (knox only)
+```text
+knox:token:{token_key}      JSON schema v2: digest, user_id, created, expiry, token_key
+knox:user:{user_id}:tokens  bounded set of cached token keys
+```
+
+Unknown, old, malformed, or mismatched cache payloads are treated as misses.
+The prefix is configurable for multi-application Redis deployments.
+
+## django-modern-rest integration
+
+The public adapters implement DMR `SyncAuth`:
+
+- `knox_redis.dmr.KnoxRedisSyncAuth` uses the hardened Redis-aware
+  authenticator;
+- `knox_redis.dmr.KnoxDatabaseSyncAuth` always uses Knox's database
+  authenticator.
+
+Both return a real Knox `AuthToken` and populate `request.user`,
+`request.auth`, `request._auth`, and `request.auser`. They preserve Knox header
+parsing for `Authorization: Token <token>` and translate DRF authentication
+errors into DMR responses with `WWW-Authenticate: Token` instead of leaking a
+500.
+
+Required authentication:
 
 ```python
-# settings.py
-REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': [
-        'knox.auth.TokenAuthentication',
-    ],
-}
+from dmr import Controller
+from dmr.plugins.msgspec import MsgspecSerializer
+from knox_redis.dmr import KnoxRedisSyncAuth
+
+
+class ProtectedController(Controller[MsgspecSerializer]):
+    auth = (KnoxRedisSyncAuth(required=True),)
 ```
 
-### After (with Redis caching)
+Optional authentication keeps DMR alternative order. With `required=False`
+(the default), missing credentials or another scheme returns `None` so the
+next authenticator can run; recognized malformed or invalid Knox credentials
+remain terminal 401 responses:
 
 ```python
-# settings.py
-REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': [
-        'knox_redis.auth.TokenAuthentication',  # Just change the import path
-    ],
-}
+class OptionalController(Controller[MsgspecSerializer]):
+    auth = (KnoxRedisSyncAuth(), MyAnonymousOrOtherSyncAuth())
 ```
 
-**That's all!** The `knox_redis.auth.TokenAuthentication` class is a drop-in replacement.
-It inherits from `knox.auth.TokenAuthentication` and adds the Redis caching layer transparently.
+OpenAPI describes Knox as `type: apiKey`, `name: Authorization`, `in: header`;
+it is not represented as a Bearer scheme.
 
----
+Native DMR `AsyncAuth` is not implemented. The adapters call synchronous Knox
+and Django ORM APIs and must be used through DMR's synchronous authentication
+path.
 
-## Configuration Reference
+## Known limitations
 
-### REST_KNOX_REDIS Settings
+- Cache hits validate the presented token but do not run Knox's opportunistic
+  cleanup loop for other expired tokens owned by the same user. Those rows are
+  removed when presented, by logout/admin/ORM cleanup, or by an application
+  maintenance task.
+- DRF and DMR translate `CacheInvalidationError` to 503. Direct ORM callers
+  receive the exception, while uncustomized Django admin error handling renders
+  it as a 500 even though the deletion transaction is safely rolled back.
+- There is no native DMR async authenticator.
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `CACHE_ALIAS` | `str` | `'default'` | Django cache alias (must use django-redis) |
-| `REDIS_KEY_PREFIX` | `str` | `'knox'` | Prefix for all Redis keys |
-| `CACHE_ENABLED` | `bool` | `True` | Enable/disable caching globally |
+## Operations
 
-### Redis Key Schema
+- Monitor Redis `keyspace_hits`, `keyspace_misses`, command latency, and the
+  application's `CacheInvalidationError`/503 rate.
+- Alert on invalidation failures: they intentionally block revocation.
+- Do not use `KEYS` in production. Inspect a prefix with `SCAN`, for example
+  `redis-cli --scan --pattern 'knox:token:*'`.
+- Keep Redis access restricted; cached data includes token digests and user
+  identifiers, never raw tokens.
 
-```
-knox:token:{token_key}         → JSON {digest, user_id, created, expiry}
-knox:user:{user_id}:tokens     → Set of token_keys (for bulk invalidation)
-```
-
----
-
-## Cache Invalidation
-
-Cache is automatically invalidated when:
-
-| Event | Action |
-|-------|--------|
-| `LogoutView.post()` | Deletes single token from Redis |
-| `LogoutAllView.post()` | Deletes all user tokens from Redis |
-| Token deleted via ORM | Signal handler invalidates cache |
-| Token expired | Removed on next auth attempt |
-| User deleted | Invalidated on next auth attempt |
-
----
-
-## Error Handling
-
-**Redis unavailable?** No problem:
-
-```python
-# Cache operations are wrapped in try/except
-# On Redis failure:
-# 1. Warning logged
-# 2. Falls back to database authentication
-# 3. Application continues working
-```
-
----
-
-## Monitoring
-
-### Check Cache Hit Rate
-
-```python
-from django.core.cache import caches
-from django_redis import get_redis_connection
-
-redis_conn = get_redis_connection("default")
-info = redis_conn.info()
-
-print(f"Cache hits: {info['keyspace_hits']}")
-print(f"Cache misses: {info['keyspace_misses']}")
-print(f"Hit rate: {info['keyspace_hits'] / (info['keyspace_hits'] + info['keyspace_misses']) * 100:.1f}%")
-```
-
-### View Cached Tokens
+## Development and release checks
 
 ```bash
-redis-cli KEYS "knox:token:*" | wc -l  # Count cached tokens
-redis-cli KEYS "knox:user:*"           # List user token indexes
+uv sync --locked --all-extras
+uv run --locked --all-extras pytest
+uv run --locked --all-extras ruff check .
+uv run --locked --all-extras ruff format --check .
+uv run --locked --all-extras mypy knox_redis
+DJANGO_SETTINGS_MODULE=tests.settings uv run --locked --all-extras django-admin check
+uv build --no-build-isolation
+uv run --locked --all-extras twine check dist/*
 ```
 
----
-
-## Development
-
-```bash
-# Clone repository
-git clone https://github.com/yourusername/django-rest-knox-redis.git
-cd django-rest-knox-redis
-
-# Install with uv
-uv sync
-
-# Run tests
-uv run pytest
-
-# Run tests with coverage
-uv run pytest --cov=knox_redis --cov-report=html
-
-# Lint
-uv run ruff check .
-uv run ruff format .
-```
-
----
-
-## Requirements
-
-- Python 3.10+
-- Django 4.2+
-- django-rest-framework 3.14+
-- django-rest-knox 4.2+
-- django-redis 5.4+
-- Redis Server 6.0+
-
----
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file.
-
----
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Submit a pull request
-
----
-
-## Credits
-
-- [django-rest-knox](https://github.com/jazzband/django-rest-knox) - The excellent token authentication library this package extends
-- [django-redis](https://github.com/jazzband/django-redis) - Redis cache backend for Django
+See [CHANGELOG.md](CHANGELOG.md) for release notes. The package is licensed
+under the [MIT License](LICENSE).

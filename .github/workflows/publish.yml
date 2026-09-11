@@ -4,37 +4,135 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
-          version: "latest"
+          version: "0.12.5"
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Install locked build dependencies
+        run: uv sync --locked --all-extras --python 3.12
 
-      - name: Build package
-        run: uv build
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          metadata = tomllib.loads(Path("pyproject.toml").read_text())
+          version = metadata["project"]["version"]
+          expected_tag = f"v{version}"
+          assert os.environ["RELEASE_TAG"] == expected_tag, (
+              os.environ["RELEASE_TAG"],
+              expected_tag,
+          )
+          PY
+
+      - name: Run locked release checks
+        env:
+          DJANGO_SETTINGS_MODULE: tests.settings
+          KNOX_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+        run: |
+          .venv/bin/python -m pytest
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check .
+          .venv/bin/python -m mypy knox_redis
+          .venv/bin/python -m django check
+
+      - name: Build package from locked environment
+        run: uv build --no-build-isolation --out-dir dist
+
+      - name: Check package metadata
+        run: .venv/bin/python -m twine check dist/*
+
+      - name: Validate release artifacts
+        run: |
+          .venv/bin/python - <<'PY'
+          from email.parser import Parser
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          dist = Path("dist")
+          artifacts = sorted(path.name for path in dist.iterdir())
+          assert artifacts == [
+              "django_rest_knox_redis-0.2.0-py3-none-any.whl",
+              "django_rest_knox_redis-0.2.0.tar.gz",
+          ], artifacts
+
+          wheel = dist / artifacts[0]
+          sdist = dist / artifacts[1]
+          with zipfile.ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+              metadata_name = next(
+                  name for name in names if name.endswith(".dist-info/METADATA")
+              )
+              metadata = Parser().parsestr(
+                  archive.read(metadata_name).decode("utf-8")
+              )
+              assert "knox_redis/dmr.py" in names
+              assert "knox_redis/py.typed" in names
+
+          assert metadata["Metadata-Version"] == "2.4"
+          assert metadata["Version"] == "0.2.0"
+          assert "dmr" in metadata.get_all("Provides-Extra", [])
+          assert any(
+              requirement.startswith("django-modern-rest>=0.12")
+              and "extra ==" in requirement
+              and "dmr" in requirement
+              for requirement in metadata.get_all("Requires-Dist", [])
+          )
+
+          with tarfile.open(sdist, "r:gz") as archive:
+              names = set(archive.getnames())
+              for required in (
+                  "knox_redis/dmr.py",
+                  "knox_redis/py.typed",
+                  "README.md",
+                  "CHANGELOG.md",
+                  "LICENSE",
+                  "pyproject.toml",
+              ):
+                  assert any(name.endswith(f"/{required}") for name in names)
+          PY
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
 
   publish-pypi:
     needs: build
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/django-rest-knox-redis
+      url: https://pypi.org/project/django-rest-knox-redis/
     permissions:
-      id-token: write # Required for trusted publishing
+      id-token: write
 
     steps:
       - name: Download artifacts
@@ -45,24 +143,3 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-
-  # publish-testpypi:
-  #   needs: build
-  #   runs-on: ubuntu-latest
-  #   environment:
-  #     name: testpypi
-  #     url: https://test.pypi.org/p/django-rest-knox-redis
-  #   permissions:
-  #     id-token: write
-
-  #   steps:
-  #     - name: Download artifacts
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: dist
-  #         path: dist/
-
-  #     - name: Publish to TestPyPI
-  #       uses: pypa/gh-action-pypi-publish@release/v1
-  #       with:
-  #         repository-url: https://test.pypi.org/legacy/

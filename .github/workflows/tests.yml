@@ -10,15 +10,46 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  test:
-    name: Python ${{ matrix.python-version }} / Django ${{ matrix.django-version }}
+  core:
+    name: Core / Python ${{ matrix.python-version }} / Django ${{ matrix.django-version }} / DRF ${{ matrix.drf-constraint }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
-        django-version: ["5.0", "5.1", "5.2", "6.0"]
+        include:
+          - python-version: "3.10"
+            django-version: "5.2"
+            drf-constraint: ">=3.17,<3.18"
+          - python-version: "3.11"
+            django-version: "5.2"
+            drf-constraint: ">=3.17,<3.18"
+          - python-version: "3.12"
+            django-version: "5.2"
+            drf-constraint: ">=3.17,<3.18"
+          - python-version: "3.13"
+            django-version: "5.2"
+            drf-constraint: ">=3.17,<3.18"
+          - python-version: "3.14"
+            django-version: "5.2"
+            drf-constraint: ">=3.17,<3.18"
+          - python-version: "3.14"
+            django-version: "6.0"
+            drf-constraint: "==3.16.1"
+            knox-constraint: "==5.0.4"
+            django-redis-constraint: "==6.0.0"
+          - python-version: "3.12"
+            django-version: "6.0"
+            drf-constraint: ">=3.17,<3.18"
+          - python-version: "3.13"
+            django-version: "6.0"
+            drf-constraint: ">=3.17,<3.18"
+          - python-version: "3.14"
+            django-version: "6.0"
+            drf-constraint: ">=3.17,<3.18"
 
     services:
       redis:
@@ -38,29 +69,185 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
-          version: "latest"
+          version: "0.12.5"
 
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
-
-      - name: Install dependencies
+      - name: Create constrained environment
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python-version }}
+          EXPECTED_DJANGO: ${{ matrix.django-version }}
+          DRF_CONSTRAINT: ${{ matrix.drf-constraint }}
+          KNOX_CONSTRAINT: ${{ matrix.knox-constraint || '>=5.1,<6' }}
+          DJANGO_REDIS_CONSTRAINT: ${{ matrix.django-redis-constraint || '>=7,<8' }}
         run: |
-          uv sync --all-extras
-          uv pip install "django~=${{ matrix.django-version }}.0"
+          uv venv --python "$EXPECTED_PYTHON" .venv
+          uv pip install --python .venv/bin/python \
+            -e ".[dev]" \
+            "django~=$EXPECTED_DJANGO.0" \
+            "djangorestframework$DRF_CONSTRAINT" \
+            "django-rest-knox$KNOX_CONSTRAINT" \
+            "django-redis$DJANGO_REDIS_CONSTRAINT"
+
+      - name: Assert installed versions
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python-version }}
+          EXPECTED_DJANGO: ${{ matrix.django-version }}
+          DRF_CONSTRAINT: ${{ matrix.drf-constraint }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import os
+          import sys
+          from importlib.metadata import version
+
+          import django
+          from packaging.version import Version
+
+          expected_python = tuple(
+              int(part) for part in os.environ["EXPECTED_PYTHON"].split(".")
+          )
+          expected_django = tuple(
+              int(part) for part in os.environ["EXPECTED_DJANGO"].split(".")
+          )
+          installed = {
+              "Django": version("Django"),
+              "djangorestframework": version("djangorestframework"),
+              "django-rest-knox": version("django-rest-knox"),
+              "django-redis": version("django-redis"),
+          }
+          print(f"Python: {sys.version}")
+          for package, package_version in installed.items():
+              print(f"{package}: {package_version}")
+
+          assert sys.version_info[:2] == expected_python
+          assert django.VERSION[:2] == expected_django
+          installed_drf = Version(installed["djangorestframework"])
+          if os.environ["DRF_CONSTRAINT"] == "==3.16.1":
+              assert installed_drf == Version("3.16.1")
+              assert Version(installed["django-rest-knox"]) == Version("5.0.4")
+              assert Version(installed["django-redis"]) == Version("6.0.0")
+          else:
+              assert Version("3.17") <= installed_drf < Version("3.18")
+              assert Version("5.1") <= Version(installed["django-rest-knox"]) < Version("6")
+              assert Version("7") <= Version(installed["django-redis"]) < Version("8")
+          PY
 
       - name: Run tests with coverage
-        run: uv run pytest --cov=knox_redis --cov-report=xml --cov-report=term-missing
+        env:
+          KNOX_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+        run: >-
+          .venv/bin/python -m pytest
+          --cov=knox_redis
+          --cov-report=xml
+          --cov-report=term-missing
 
       - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.12' && matrix.django-version == '5.1'
+        if: matrix.python-version == '3.12' && matrix.django-version == '5.2'
         uses: codecov/codecov-action@v4
         with:
           file: ./coverage.xml
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  dmr:
+    name: DMR ${{ matrix.dmr-constraint }} / Python ${{ matrix.python-version }} / Django ${{ matrix.django-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.11"
+            django-version: "5.2"
+            dmr-constraint: "==0.12.0"
+          - python-version: "3.12"
+            django-version: "6.0"
+            dmr-constraint: "==0.12.0"
+          - python-version: "3.14"
+            django-version: "5.2"
+            dmr-constraint: ">=0.12"
+          - python-version: "3.14"
+            django-version: "6.0"
+            dmr-constraint: ">=0.12"
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.12.5"
+
+      - name: Create constrained environment
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python-version }}
+          EXPECTED_DJANGO: ${{ matrix.django-version }}
+          DMR_CONSTRAINT: ${{ matrix.dmr-constraint }}
+        run: |
+          uv venv --python "$EXPECTED_PYTHON" .venv
+          uv pip install --python .venv/bin/python \
+            -e ".[dev,dmr]" \
+            "django~=$EXPECTED_DJANGO.0" \
+            "django-modern-rest$DMR_CONSTRAINT"
+
+      - name: Assert installed versions
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python-version }}
+          EXPECTED_DJANGO: ${{ matrix.django-version }}
+          DMR_CONSTRAINT: ${{ matrix.dmr-constraint }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import os
+          import sys
+          from importlib.metadata import version
+
+          import django
+          import dmr
+          from packaging.version import Version
+
+          expected_python = tuple(
+              int(part) for part in os.environ["EXPECTED_PYTHON"].split(".")
+          )
+          expected_django = tuple(
+              int(part) for part in os.environ["EXPECTED_DJANGO"].split(".")
+          )
+          installed = {
+              "Django": version("Django"),
+              "djangorestframework": version("djangorestframework"),
+              "django-rest-knox": version("django-rest-knox"),
+              "django-redis": version("django-redis"),
+              "django-modern-rest": version("django-modern-rest"),
+          }
+          print(f"Python: {sys.version}")
+          print(f"DMR module: {dmr.__file__}")
+          for package, package_version in installed.items():
+              print(f"{package}: {package_version}")
+
+          assert sys.version_info[:2] == expected_python
+          assert django.VERSION[:2] == expected_django
+          assert Version("3.17") <= Version(installed["djangorestframework"]) < Version("3.18")
+          assert Version("5.1") <= Version(installed["django-rest-knox"]) < Version("6")
+          assert Version("7") <= Version(installed["django-redis"]) < Version("8")
+          if os.environ["DMR_CONSTRAINT"] == "==0.12.0":
+              assert Version(installed["django-modern-rest"]) == Version("0.12.0")
+          else:
+              assert Version(installed["django-modern-rest"]) >= Version("0.12")
+          PY
+
+      - name: Run DMR tests
+        run: .venv/bin/python -m pytest tests/test_dmr.py
+
   lint:
-    name: Lint
+    name: Lint and typing
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -69,19 +256,24 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
-          version: "latest"
+          version: "0.12.5"
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --python 3.12
 
-      - name: Install dependencies
-        run: uv sync --all-extras
+      - name: Check code style with Ruff
+        run: uv run --locked --all-extras ruff check .
 
-      - name: Check code style with ruff
-        run: uv run ruff check .
+      - name: Check code formatting with Ruff
+        run: uv run --locked --all-extras ruff format --check .
 
-      - name: Check code formatting with ruff
-        run: uv run ruff format --check .
+      - name: Check shipped package typing
+        run: uv run --locked --all-extras mypy knox_redis
+
+      - name: Run Django system checks
+        env:
+          DJANGO_SETTINGS_MODULE: tests.settings
+        run: .venv/bin/python -m django check
 
   build:
     name: Build package
@@ -93,16 +285,62 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
-          version: "latest"
+          version: "0.12.5"
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Install locked build dependencies
+        run: uv sync --locked --all-extras --python 3.12
 
-      - name: Build package
-        run: uv build
+      - name: Build package from locked environment
+        run: uv build --no-build-isolation --out-dir dist
 
       - name: Check package metadata
-        run: uvx twine check dist/*
+        run: .venv/bin/python -m twine check dist/*
+
+      - name: Inspect package artifacts
+        run: |
+          .venv/bin/python - <<'PY'
+          from email.parser import Parser
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          dist = Path("dist")
+          wheel = next(dist.glob("django_rest_knox_redis-0.2.0-*.whl"))
+          sdist = next(dist.glob("django_rest_knox_redis-0.2.0.tar.gz"))
+
+          with zipfile.ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+              metadata_name = next(
+                  name for name in names if name.endswith(".dist-info/METADATA")
+              )
+              metadata = Parser().parsestr(
+                  archive.read(metadata_name).decode("utf-8")
+              )
+              assert "knox_redis/dmr.py" in names
+              assert "knox_redis/py.typed" in names
+
+          assert metadata["Metadata-Version"] == "2.4"
+          assert metadata["Version"] == "0.2.0"
+          assert "dmr" in metadata.get_all("Provides-Extra", [])
+          assert any(
+              requirement.startswith("django-modern-rest>=0.12")
+              and "extra ==" in requirement
+              and "dmr" in requirement
+              for requirement in metadata.get_all("Requires-Dist", [])
+          )
+
+          with tarfile.open(sdist, "r:gz") as archive:
+              names = set(archive.getnames())
+              for required in (
+                  "knox_redis/dmr.py",
+                  "knox_redis/py.typed",
+                  "README.md",
+                  "CHANGELOG.md",
+                  "LICENSE",
+                  "pyproject.toml",
+              ):
+                  assert any(name.endswith(f"/{required}") for name in names)
+          PY
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

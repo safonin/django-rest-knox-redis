@@ -1,11 +1,10 @@
-"""
-Signal handlers for automatic cache invalidation.
-
-Handles cache invalidation when tokens are deleted directly via ORM/admin.
-"""
+"""Fail-closed cache invalidation for Knox token deletion."""
 
 import logging
+from functools import partial
+from typing import Any
 
+from django.db import transaction
 from django.db.models.signals import pre_delete
 
 from knox_redis.cache import TokenCache
@@ -14,49 +13,44 @@ from knox_redis.settings import knox_redis_settings
 logger = logging.getLogger(__name__)
 
 
-def invalidate_token_on_delete(sender, instance, **kwargs):
-    """
-    Invalidate cache when an AuthToken is deleted.
-
-    This handles direct model deletions that bypass our custom views,
-    such as deletions via admin panel, management commands, or direct ORM operations.
-    """
+def invalidate_token_on_delete(
+    sender: type[Any], instance: Any, using: str, **kwargs: Any
+) -> None:
+    """Require invalidation before delete and retry cleanup after commit."""
+    del sender, kwargs
     if not knox_redis_settings.CACHE_ENABLED:
         return
 
-    try:
-        TokenCache.delete_token(instance.token_key, instance.user_id)
-        logger.debug(f"Invalidated token cache for token_key={instance.token_key}")
-    except Exception as e:
-        logger.warning(f"Failed to invalidate token cache on delete: {e}")
+    TokenCache.delete_token(
+        instance.token_key,
+        instance.user_id,
+        raise_on_error=True,
+    )
+    transaction.on_commit(
+        partial(TokenCache.delete_token, instance.token_key, instance.user_id),
+        using=using,
+    )
+    logger.debug("Invalidated token cache for token_key=%s", instance.token_key)
 
 
-def connect_signals():
-    """
-    Connect signals with the actual AuthToken model.
-
-    Called from AppConfig.ready() to ensure models are loaded.
-    """
+def connect_signals() -> None:
+    """Connect invalidation to the configured Knox token model."""
     from knox.models import get_token_model
 
-    AuthToken = get_token_model()
+    token_model = get_token_model()
     pre_delete.connect(
         invalidate_token_on_delete,
-        sender=AuthToken,
+        sender=token_model,
         dispatch_uid="knox_redis_token_delete",
     )
-    logger.debug(f"Connected knox_redis signals to {AuthToken}")
 
 
-def disconnect_signals():
-    """
-    Disconnect signals (useful for testing).
-    """
+def disconnect_signals() -> None:
+    """Disconnect package signals for isolated tests."""
     from knox.models import get_token_model
 
-    AuthToken = get_token_model()
     pre_delete.disconnect(
         invalidate_token_on_delete,
-        sender=AuthToken,
+        sender=get_token_model(),
         dispatch_uid="knox_redis_token_delete",
     )

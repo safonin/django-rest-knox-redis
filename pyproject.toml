@@ -1,11 +1,11 @@
 [project]
 name = "django-rest-knox-redis"
-version = "0.1.3"
-description = "Redis caching layer for django-rest-knox - dramatically reduce database load on token authentication"
+version = "0.2.0"
+description = "Redis-backed authentication cache for django-rest-knox"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
-    {name = "Your Name", email = "your@email.com"}
+    {name = "Sergey Afonin", email = "sergey@afonin.name"}
 ]
 keywords = [
     "django",
@@ -22,39 +22,46 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Web Environment",
     "Framework :: Django",
-    "Framework :: Django :: 4.2",
-    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.2",
     "Framework :: Django :: 6.0",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: WWW/HTTP :: Session",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 dependencies = [
-    "django>=4.2",
-    "djangorestframework>=3.14",
-    "django-rest-knox>=4.2.0",
-    "django-redis>=5.4.0",
+    "django>=5.2,<6.1",
+    "djangorestframework>=3.16.1,<3.18",
+    "django-rest-knox>=5.0.4,<6",
+    "django-redis>=6,<8",
 ]
 
 [project.optional-dependencies]
+dmr = [
+    "django-modern-rest>=0.12",
+]
 dev = [
-    "pytest>=8.0",
-    "pytest-django>=4.5",
-    "pytest-cov>=4.0",
-    "pytest-mock>=3.12",
+    "django-stubs>=5.2,<6.1",
+    "djangorestframework-stubs>=3.16,<3.18",
     "fakeredis>=2.20",
+    "hatchling>=1.27,<2",
+    "msgspec>=0.21.1,<1",
+    "mypy>=1.8,<3",
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "pytest-django>=4.5",
+    "pytest-mock>=3.12",
     "ruff>=0.1.0",
-    "mypy>=1.8",
-    "django-stubs>=4.2",
-    "djangorestframework-stubs>=3.14",
+    "twine>=6.2,<7",
 ]
 
 [project.urls]
@@ -62,16 +69,18 @@ Homepage = "https://github.com/safonin/django-rest-knox-redis"
 Documentation = "https://github.com/safonin/django-rest-knox-redis#readme"
 Repository = "https://github.com/safonin/django-rest-knox-redis"
 Issues = "https://github.com/safonin/django-rest-knox-redis/issues"
-Changelog = "https://github.com/safonin/django-rest-knox-redis/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/safonin/django-rest-knox-redis/blob/master/CHANGELOG.md"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["knox_redis"]
+core-metadata-version = "2.4"
 
 [tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"
 include = [
     "/knox_redis",
     "/tests",
@@ -82,13 +91,24 @@ include = [
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
-    "pytest-django>=4.5",
-    "pytest-cov>=4.0",
-    "pytest-mock>=3.12",
+    "django-stubs>=5.2,<6.1",
+    "djangorestframework-stubs>=3.16,<3.18",
     "fakeredis>=2.20",
+    "hatchling>=1.27,<2",
+    "msgspec>=0.21.1,<1",
+    "mypy>=1.8,<3",
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "pytest-django>=4.5",
+    "pytest-mock>=3.12",
     "ruff>=0.1.0",
+    "twine>=6.2,<7",
 ]
+
+[tool.uv]
+# The development lock includes the DMR extra, whose own floor is Python 3.11.
+# Base-package Python 3.10 compatibility is tested by the fresh CI matrix venv.
+environments = ["python_version >= '3.11' and python_version < '3.15'"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
@@ -123,6 +143,11 @@ plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["knox", "knox.*"]
+ignore_missing_imports = true
+disallow_subclassing_any = false
 
 [tool.django-stubs]
 django_settings_module = "tests.settings"
