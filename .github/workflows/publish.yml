@@ -62,7 +62,7 @@ jobs:
           .venv/bin/python -m django check
 
       - name: Build package from locked environment
-        run: uv build --no-build-isolation --out-dir dist
+        run: uv build --no-build-isolation --no-create-gitignore --out-dir dist
 
       - name: Check package metadata
         run: .venv/bin/python -m twine check dist/*
