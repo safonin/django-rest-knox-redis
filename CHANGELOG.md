@@ -54,6 +54,8 @@ All notable changes to this project are documented here. The format follows
 - Cache-hit AUTO_REFRESH no longer silently skips Knox renewal semantics.
 - Short-lived tokens no longer shorten the user-token index TTL below the
   lifetime of other bounded cached entries.
+- DMR 0.15 endpoint construction no longer raises `NotImplementedError`; Knox
+  adapters now expose the framework's `www_authenticate_challenge` contract.
 
 ### Security
 

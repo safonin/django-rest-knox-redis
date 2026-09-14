@@ -38,6 +38,11 @@ def _authorization(raw_token: str) -> str:
     return f"Token {raw_token}"
 
 
+@pytest.mark.parametrize("auth_class", [KnoxRedisSyncAuth, KnoxDatabaseSyncAuth])
+def test_adapters_advertise_knox_www_authenticate_challenge(auth_class) -> None:
+    assert auth_class().www_authenticate_challenge == "Token"
+
+
 def test_redis_adapter_authenticates_a_cached_token_with_full_request_state(
     client,
     auth_token,

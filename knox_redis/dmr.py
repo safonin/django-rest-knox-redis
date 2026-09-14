@@ -74,6 +74,12 @@ class _BaseKnoxSyncAuth(SyncAuth):
         """Require this scheme without changing DMR alternative ordering."""
         return {self.security_scheme_name: []}
 
+    @property
+    @override
+    def www_authenticate_challenge(self) -> str:
+        """Advertise the Knox authorization scheme to DMR 0.15 and newer."""
+        return "Token"
+
     @override
     def provide_response_specs(
         self,

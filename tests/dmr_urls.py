@@ -49,6 +49,10 @@ class AnonymousSyncAuth(SyncAuth):
     def security_requirement(self) -> dict[str, list[str]]:
         return {}
 
+    @property
+    def www_authenticate_challenge(self) -> str | None:
+        return None
+
     def __call__(
         self,
         endpoint: Endpoint,
@@ -86,6 +90,10 @@ class EarlierSyncAuth(SyncAuth):
     @property
     def security_requirement(self) -> dict[str, list[str]]:
         return {"earlier_auth": []}
+
+    @property
+    def www_authenticate_challenge(self) -> str | None:
+        return None
 
     def __call__(
         self,
