@@ -75,7 +75,6 @@ class _BaseKnoxSyncAuth(SyncAuth):
         return {self.security_scheme_name: []}
 
     @property
-    @override
     def www_authenticate_challenge(self) -> str:
         """Advertise the Knox authorization scheme to DMR 0.15 and newer."""
         return "Token"
